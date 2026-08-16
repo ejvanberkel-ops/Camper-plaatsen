@@ -772,7 +772,7 @@ const POI_CATEGORIES = {
   hospital:    { label: 'Ziekenhuis',           variants: [[{key:'amenity',value:'hospital'}]] },
   viewpoint:   { label: 'Uitzichtpunt',         variants: [[{key:'tourism',value:'viewpoint'}]] },
   pool:        { label: 'Zwembad (publiek)',    variants: [
-                   [{key:'leisure',value:'swimming_pool'},{key:'access',value:'private',op:'!='}]
+                   [{key:'leisure',value:'swimming_pool'},{key:'access',op:'exists'},{key:'access',value:'private',op:'!='}]
                  ] },
   playground:  { label: 'Speeltuin',            variants: [[{key:'leisure',value:'playground'}]] }
 };
@@ -797,7 +797,7 @@ function parseCustomTag(text){
 }
 
 function tagBlock(pairs){
-  return pairs.map(p => `["${p.key}"${p.op || '='}"${p.value}"]`).join('');
+  return pairs.map(p => p.op === 'exists' ? `["${p.key}"]` : `["${p.key}"${p.op || '='}"${p.value}"]`).join('');
 }
 
 async function fetchPoiSites(lat, lon, radius, categories, customPairs){
@@ -832,7 +832,9 @@ async function runPoiSearch(loc, radius){
     const {lat, lon} = elementLatLon(el);
     const tags = el.tags || {};
     const matched = categories.find(c => c.variants.some(v => v.every(p =>
-      p.op === '!=' ? tags[p.key] !== p.value : tags[p.key] === p.value
+      p.op === 'exists' ? (tags[p.key] !== undefined && tags[p.key] !== '')
+      : p.op === '!=' ? tags[p.key] !== p.value
+      : tags[p.key] === p.value
     )));
     const categoryLabel = matched ? matched.label : (customPairs ? 'Eigen tag' : 'Onbekend');
     return { id: el.id, type: el.type, tags, lat, lon, categoryLabel, distance: haversine(loc.lat, loc.lon, lat, lon) };
