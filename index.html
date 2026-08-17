@@ -1049,19 +1049,64 @@ function routeBbox(routeCoords, bufferKm){
 // Echte rijroute via OSRM's gratis publieke demo-server. Geeft [[lat,lon],...] terug.
 // Lukt dit niet (server onbereikbaar, geen route gevonden, timeout), dan gooien we een
 // fout die de aanroeper opvangt om terug te vallen op een rechte lijn.
-async function fetchOsrmRoute(startLoc, endLoc){
-  const url = `https://router.project-osrm.org/route/v1/driving/${startLoc.lon},${startLoc.lat};${endLoc.lon},${endLoc.lat}?overview=full&geometries=geojson`;
+async function fetchOsrmRoute(startLoc, endLoc, viaPoints){
+  const coordParts = [`${startLoc.lon},${startLoc.lat}`];
+  if(viaPoints && viaPoints.length){
+    viaPoints.forEach(p => coordParts.push(`${p.lon},${p.lat}`));
+  }
+  coordParts.push(`${endLoc.lon},${endLoc.lat}`);
+  const url = `https://router.project-osrm.org/route/v1/driving/${coordParts.join(';')}?overview=full&geometries=geojson`;
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 12000);
+  const timer = setTimeout(() => controller.abort(), 15000);
   try{
     const res = await fetch(url, { signal: controller.signal });
     if(!res.ok) throw new Error(`Route-server gaf HTTP ${res.status}`);
     const data = await res.json();
-    if(!data.routes || !data.routes.length) throw new Error('Geen route gevonden tussen deze twee punten');
+    if(!data.routes || !data.routes.length) throw new Error('Geen route gevonden tussen deze punten');
     return data.routes[0].geometry.coordinates.map(([lon, lat]) => [lat, lon]);
   }finally{
     clearTimeout(timer);
   }
+}
+
+// Projecteert een punt op de rechte lijn start->eind (0 = bij start, 1 = bij eind, kan
+// buiten dat bereik vallen). Gebruikt om referentiepunten van een specifieke weg
+// grofweg in start->eind-volgorde te kunnen sorteren.
+function projectionAlongLine(px, py, ax, ay, bx, by){
+  const dx = bx-ax, dy = by-ay;
+  const lengthSq = dx*dx + dy*dy;
+  if(lengthSq === 0) return 0;
+  return ((px-ax)*dx + (py-ay)*dy) / lengthSq;
+}
+
+// Kiest een handvol punten van de gevonden wegnummer-segmenten (bv. de N10) die als
+// "via"-tussenstops aan de routeplanner meegegeven kunnen worden, zodat de berekende
+// route die weg daadwerkelijk volgt i.p.v. 'm alleen decoratief op de kaart te tonen.
+function sampleViaPointsFromWays(ways, startLoc, endLoc, maxPoints){
+  const startXY = toLocalXY(startLoc.lat, startLoc.lon, startLoc.lat, startLoc.lon);
+  const endXY = toLocalXY(endLoc.lat, endLoc.lon, startLoc.lat, startLoc.lon);
+  const points = [];
+  ways.forEach(w => {
+    if(!w.geometry) return;
+    w.geometry.forEach(g => {
+      const xy = toLocalXY(g.lat, g.lon, startLoc.lat, startLoc.lon);
+      const proj = projectionAlongLine(xy.x, xy.y, startXY.x, startXY.y, endXY.x, endXY.y);
+      points.push({ lat: g.lat, lon: g.lon, proj });
+    });
+  });
+  if(!points.length) return [];
+
+  points.sort((a,b) => a.proj - b.proj);
+  // alleen punten die echt tussen start en eind liggen, niet er ver voorbij
+  const usable = points.filter(p => p.proj > 0.03 && p.proj < 0.97);
+  if(!usable.length) return [];
+
+  const step = Math.max(1, Math.floor(usable.length / maxPoints));
+  const sampled = [];
+  for(let i = 0; i < usable.length; i += step){
+    sampled.push(usable[i]);
+  }
+  return sampled.slice(0, maxPoints);
 }
 
 function escapeRegex(s){
@@ -1118,25 +1163,46 @@ async function runRouteSearch(){
     const startLoc = await resolveLocation(document.getElementById('routeStart'));
     const endLoc = await resolveLocation(document.getElementById('routeEnd'));
 
+    // Als er een wegnummer is opgegeven, halen we eerst die wegsegmenten op (binnen een
+    // ruime, voorlopige bbox rond start/eind) en gebruiken we een selectie van hun eigen
+    // coördinaten als "via"-tussenstops voor de routeplanner — zo volgt de berekende route
+    // die weg daadwerkelijk, in plaats van 'm alleen decoratief te tonen.
+    let roadRefCoords = null;
+    let viaPoints = null;
+    if(roadNumber){
+      statusEl.textContent = `Weg ${roadNumber} opzoeken…`;
+      const prelimBbox = routeBbox([[startLoc.lat, startLoc.lon], [endLoc.lat, endLoc.lon]], bufferKm + 15);
+      const ways = await fetchRoadReference(prelimBbox, roadNumber);
+      if(ways && ways.length){
+        roadRefCoords = ways.filter(w => w.geometry && w.geometry.length).map(w => w.geometry.map(g => [g.lat, g.lon]));
+        viaPoints = sampleViaPointsFromWays(ways, startLoc, endLoc, 8);
+      }
+    }
+
     statusEl.textContent = 'Route ophalen…';
     let routeCoords, routeSource;
     try{
-      routeCoords = await fetchOsrmRoute(startLoc, endLoc);
-      routeSource = 'route';
+      routeCoords = await fetchOsrmRoute(startLoc, endLoc, viaPoints && viaPoints.length ? viaPoints : null);
+      routeSource = viaPoints && viaPoints.length ? 'route-via-road' : 'route';
     }catch(routeErr){
-      routeCoords = [[startLoc.lat, startLoc.lon], [endLoc.lat, endLoc.lon]];
-      routeSource = 'straight';
-    }
-
-    const bbox = routeBbox(routeCoords, bufferKm);
-
-    let roadRefCoords = null;
-    if(roadNumber){
-      const ways = await fetchRoadReference(bbox, roadNumber);
-      if(ways && ways.length){
-        roadRefCoords = ways.filter(w => w.geometry && w.geometry.length).map(w => w.geometry.map(g => [g.lat, g.lon]));
+      if(viaPoints && viaPoints.length){
+        // de via-punten gaven mogelijk een onmogelijke/rare combinatie — probeer zonder
+        try{
+          routeCoords = await fetchOsrmRoute(startLoc, endLoc, null);
+          routeSource = 'route';
+        }catch(err2){
+          routeCoords = [[startLoc.lat, startLoc.lon], [endLoc.lat, endLoc.lon]];
+          routeSource = 'straight';
+        }
+      } else {
+        routeCoords = [[startLoc.lat, startLoc.lon], [endLoc.lat, endLoc.lon]];
+        routeSource = 'straight';
       }
     }
+
+    // bbox voor de daadwerkelijke POI-zoekopdracht baseren we op de FINALE route
+    // (die na het meegeven van via-punten net iets anders kan lopen dan de voorlopige bbox)
+    const bbox = routeBbox(routeCoords, bufferKm);
 
     statusEl.textContent = 'POI\'s ophalen langs de route…';
     const elements = await fetchRoutePois(bbox, categories);
@@ -1164,7 +1230,11 @@ async function runRouteSearch(){
 
     const totalRouteKm = geometry.cumulative[geometry.cumulative.length - 1];
     const labels = categories.map(c => c.label).join(', ');
-    const sourceNote = routeSource === 'straight' ? ' — let op: geen rijroute gevonden, dit is een rechte lijn' : '';
+    const sourceNote = routeSource === 'straight'
+      ? ' — let op: geen rijroute gevonden, dit is een rechte lijn'
+      : routeSource === 'route-via-road'
+      ? ` — route gestuurd via ${roadNumber}`
+      : '';
     statusEl.textContent = `${sites.length} resultaat${sites.length === 1 ? '' : 'en'} (${labels}) gevonden binnen ${bufferKm} km van de route van ${startLoc.label.split(',')[0]} naar ${endLoc.label.split(',')[0]} (~${totalRouteKm.toFixed(0)} km)${sourceNote}.`;
 
     renderRouteResults(sites, routeCoords, roadRefCoords, startLoc, endLoc, routeSource);
@@ -1203,7 +1273,7 @@ function renderRouteResults(sites, routeCoords, roadRefCoords, startLoc, endLoc,
   contextMarkers.push(startMarker, endMarker);
 
   legendEl.innerHTML = `
-    <span><i style="background:#4A7C94;"></i> Route${routeSource === 'straight' ? ' (rechte lijn)' : ''}</span>
+    <span><i style="background:#4A7C94;"></i> Route${routeSource === 'straight' ? ' (rechte lijn)' : routeSource === 'route-via-road' ? ' (via wegnummer)' : ''}</span>
     ${roadRefCoords ? `<span><i style="background:#C67F17;"></i> Wegnummer-referentie</span>` : ''}
     <span><i style="background:#1D3B2C;"></i> Start</span>
     <span><i style="background:#A33B2A;"></i> Eind</span>`;
@@ -1223,12 +1293,19 @@ function renderRouteResults(sites, routeCoords, roadRefCoords, startLoc, endLoc,
     const distLabel = site.distanceFromRoute < 1
       ? (site.distanceFromRoute*1000).toFixed(0) + ' m'
       : site.distanceFromRoute.toFixed(1) + ' km';
+    const accessBadge = site.tags.access && site.tags.access !== 'yes'
+      ? `<span class="badge warn">Toegang: ${site.tags.access}</span>` : '';
+    const feeBadge = site.tags.fee === 'yes'
+      ? `<span class="badge warn">Betaald${site.tags.charge ? ' · ' + site.tags.charge : ''}</span>`
+      : site.tags.fee === 'no' ? `<span class="badge good">Gratis</span>` : '';
+    const descLine = site.tags.description ? `<p class="addr" style="font-style:italic;">${site.tags.description}</p>` : '';
     el.innerHTML = `
       <div class="pin">${i+1}</div>
       <div class="body">
         <p class="name">${site.tags.name || 'Naamloze locatie'} <span class="dist">${site.progressKm.toFixed(0)} km vanaf start</span></p>
         <p class="addr">${addrParts.join(' ') || 'Geen adres bekend'}</p>
-        <div class="badges"><span class="badge">${site.categoryLabel}</span><span class="badge">📍 ${distLabel} van route</span></div>
+        ${descLine}
+        <div class="badges"><span class="badge">${site.categoryLabel}</span><span class="badge">📍 ${distLabel} van route</span>${accessBadge}${feeBadge}</div>
         <div class="links">
           <a class="gmaps-link" href="${googleMapsLink(site.lat, site.lon)}" target="_blank">🧭 Navigeer</a>
           <a class="osm-link" href="https://www.openstreetmap.org/${site.type}/${site.id}" target="_blank">Bekijk op OpenStreetMap →</a>
