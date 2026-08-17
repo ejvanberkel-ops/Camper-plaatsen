@@ -1113,6 +1113,14 @@ function escapeRegex(s){
   return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
+// Maakt wegnummer-invoer wat vergevingsgezinder: "n 10", " N10 ", "n10" worden allemaal "N10".
+// Spaties/streepjes binnen het nummer zelf (zoals "CA-141") laten we intact, alleen rondom-
+// spaties en losse spaties tussen letter en cijfer worden opgeruimd; matching in Overpass
+// is daarnaast al hoofdletterongevoelig.
+function normalizeRoadNumber(input){
+  return input.trim().replace(/\s+/g, '').toUpperCase();
+}
+
 // Best-effort: probeert de wegen met dit wegnummer binnen het gebied te vinden, puur om
 // als visuele referentielijn op de kaart te tonen. Lukt dit niet, dan negeren we het gewoon —
 // de corridor-zoekopdracht zelf hangt hier niet vanaf.
@@ -1129,14 +1137,71 @@ async function fetchRoadReference(bbox, roadNumber){
 async function fetchRoutePois(bbox, categories){
   const allBlocks = categories.flatMap(c => c.variants.map(v => tagBlock(v)));
   const lines = allBlocks.map(f => `\n    node${f};\n    way${f};`).join('');
-  const query = `[out:json][timeout:25][bbox:${bbox}];(${lines}\n  );out center tags 400;`;
+  const query = `[out:json][timeout:25][bbox:${bbox}];(${lines}\n  );out center tags 200;`;
   return overpassAttempt(query, 20000);
+}
+
+// Knipt de route op in stukken van maximaal ~zoveel km, zodat elke Overpass-query een
+// kleine, snelle bbox heeft in plaats van één grote query over de hele routelengte
+// (wat bij lange routes tot 504's/timeouts leidde, vooral met brede categorieën als
+// "parkeerplaats"). We geven kleine overlap tussen stukken zodat we geen POI's missen
+// die precies op een naad zouden vallen.
+function splitRouteIntoChunks(routeCoords, geometry, targetChunkKm){
+  const totalKm = geometry.cumulative[geometry.cumulative.length - 1];
+  if(totalKm <= targetChunkKm) return [routeCoords];
+
+  const chunks = [];
+  let startIdx = 0;
+  let startDist = 0;
+  for(let i = 1; i < geometry.cumulative.length; i++){
+    const isLast = i === geometry.cumulative.length - 1;
+    if(geometry.cumulative[i] - startDist >= targetChunkKm || isLast){
+      const endIdx = Math.min(geometry.cumulative.length - 1, i + 1); // klein beetje overlap
+      chunks.push(routeCoords.slice(startIdx, endIdx + 1));
+      startIdx = i;
+      startDist = geometry.cumulative[i];
+    }
+  }
+  return chunks;
+}
+
+// Haalt POI's op per routestuk (parallel), en voegt de resultaten samen zonder duplicaten.
+// Als één stuk faalt (bv. een trage server op dat moment), gaan de andere stukken gewoon door —
+// je krijgt dan resultaten voor de rest van de route i.p.v. een harde fout voor de hele zoekopdracht.
+async function fetchRoutePoisChunked(routeCoords, geometry, categories, bufferKm){
+  const chunks = splitRouteIntoChunks(routeCoords, geometry, 60);
+  const results = await Promise.allSettled(
+    chunks.map(chunk => fetchRoutePois(routeBbox(chunk, bufferKm), categories))
+  );
+
+  const seen = new Set();
+  const merged = [];
+  let failedChunks = 0;
+  results.forEach(r => {
+    if(r.status === 'fulfilled'){
+      r.value.forEach(el => {
+        const key = `${el.type}:${el.id}`;
+        if(!seen.has(key)){
+          seen.add(key);
+          merged.push(el);
+        }
+      });
+    } else {
+      failedChunks++;
+    }
+  });
+
+  if(merged.length === 0 && failedChunks > 0){
+    throw new Error(`Kon geen data ophalen voor ${failedChunks} van de ${chunks.length} routestukken. Probeer het nog eens.`);
+  }
+
+  return { elements: merged, failedChunks, totalChunks: chunks.length };
 }
 
 async function runRouteSearch(){
   const startQuery = document.getElementById('routeStart').value.trim();
   const endQuery = document.getElementById('routeEnd').value.trim();
-  const roadNumber = document.getElementById('routeRoadNumber').value.trim();
+  const roadNumber = normalizeRoadNumber(document.getElementById('routeRoadNumber').value);
   const bufferKm = parseInt(document.getElementById('routeBuffer').value, 10);
   const categories = selectedRouteCategories();
 
@@ -1200,13 +1265,10 @@ async function runRouteSearch(){
       }
     }
 
-    // bbox voor de daadwerkelijke POI-zoekopdracht baseren we op de FINALE route
-    // (die na het meegeven van via-punten net iets anders kan lopen dan de voorlopige bbox)
-    const bbox = routeBbox(routeCoords, bufferKm);
-
-    statusEl.textContent = 'POI\'s ophalen langs de route…';
-    const elements = await fetchRoutePois(bbox, categories);
     const geometry = prepareRouteGeometry(routeCoords);
+
+    statusEl.textContent = 'POI\'s ophalen langs de route (per stuk)…';
+    const { elements, failedChunks, totalChunks } = await fetchRoutePoisChunked(routeCoords, geometry, categories, bufferKm);
 
     let sites = elements.map(el => {
       const {lat, lon} = elementLatLon(el);
@@ -1235,7 +1297,10 @@ async function runRouteSearch(){
       : routeSource === 'route-via-road'
       ? ` — route gestuurd via ${roadNumber}`
       : '';
-    statusEl.textContent = `${sites.length} resultaat${sites.length === 1 ? '' : 'en'} (${labels}) gevonden binnen ${bufferKm} km van de route van ${startLoc.label.split(',')[0]} naar ${endLoc.label.split(',')[0]} (~${totalRouteKm.toFixed(0)} km)${sourceNote}.`;
+    const chunkNote = failedChunks > 0
+      ? ` (let op: ${failedChunks} van de ${totalChunks} routestukken kon niet opgehaald worden — mogelijk ontbreken daar resultaten, probeer eventueel opnieuw)`
+      : '';
+    statusEl.textContent = `${sites.length} resultaat${sites.length === 1 ? '' : 'en'} (${labels}) gevonden binnen ${bufferKm} km van de route van ${startLoc.label.split(',')[0]} naar ${endLoc.label.split(',')[0]} (~${totalRouteKm.toFixed(0)} km)${sourceNote}.${chunkNote}`;
 
     renderRouteResults(sites, routeCoords, roadRefCoords, startLoc, endLoc, routeSource);
 
