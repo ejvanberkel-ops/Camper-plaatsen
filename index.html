@@ -1170,26 +1170,32 @@ function splitRouteIntoChunks(routeCoords, geometry, targetChunkKm){
 // je krijgt dan resultaten voor de rest van de route i.p.v. een harde fout voor de hele zoekopdracht.
 async function fetchRoutePoisChunked(routeCoords, geometry, categories, bufferKm){
   const chunks = splitRouteIntoChunks(routeCoords, geometry, 60);
-  const results = await Promise.allSettled(
-    chunks.map(chunk => fetchRoutePois(routeBbox(chunk, bufferKm), categories))
-  );
 
+  // Bewust NA ELKAAR i.p.v. allemaal tegelijk: publieke Overpass-servers staan doorgaans
+  // maar een paar gelijktijdige verbindingen per IP toe. Met bv. 4 routestukken × 3 mirrors
+  // vuurden we voorheen 12 verzoeken tegelijk af, waardoor de meeste geweigerd/getimed-out
+  // werden. Sequentieel is iets trager, maar betrouwbaar veel completer.
   const seen = new Set();
   const merged = [];
   let failedChunks = 0;
-  results.forEach(r => {
-    if(r.status === 'fulfilled'){
-      r.value.forEach(el => {
+
+  for(let i = 0; i < chunks.length; i++){
+    if(chunks.length > 1){
+      statusEl.textContent = `POI's ophalen langs de route… (stuk ${i+1} van ${chunks.length})`;
+    }
+    try{
+      const elements = await fetchRoutePois(routeBbox(chunks[i], bufferKm), categories);
+      elements.forEach(el => {
         const key = `${el.type}:${el.id}`;
         if(!seen.has(key)){
           seen.add(key);
           merged.push(el);
         }
       });
-    } else {
+    }catch(err){
       failedChunks++;
     }
-  });
+  }
 
   if(merged.length === 0 && failedChunks > 0){
     throw new Error(`Kon geen data ophalen voor ${failedChunks} van de ${chunks.length} routestukken. Probeer het nog eens.`);
