@@ -426,15 +426,53 @@ function bboxAround(lat, lon, radiusMeters){
 
 // ---------- Overpass helper (met fallback naar meerdere servers) ----------
 const OVERPASS_ENDPOINTS = [
-  'https://overpass-api.de/api/interpreter',
   'https://overpass.kumi.systems/api/interpreter',
-  'https://overpass.openstreetmap.ru/api/interpreter'
+  'https://overpass.openstreetmap.ru/api/interpreter',
+  'https://overpass-api.de/api/interpreter'
 ];
 
 // Race alle mirrors tegelijk (i.p.v. na elkaar) — de eerste die antwoordt "wint",
 // de rest wordt meteen geannuleerd. Zo hangen we niet vast aan één trage server.
 // Geeft bij een HTTP-fout de ECHTE reden mee (bv. 400 = query zelf is fout)
 // i.p.v. dat te verwarren met "onbereikbaar".
+// Probeert de mirrors NA ELKAAR (niet gelijktijdig racen) en geeft het eerste succes terug.
+// De routemodus doet sowieso al meerdere losse Overpass-aanroepen per zoekopdracht (één per
+// routestuk); als elke aanroep ook nog eens alle 3 mirrors gelijktijdig belast, loopt het totale
+// verzoeksaantal tegen de sessie snel op — en publieke Overpass-servers hanteren vaak een
+// tijdvenster-gebaseerde limiet (bv. "max X verzoeken per minuut"), niet alleen een limiet op
+// gelijktijdige verbindingen. Eén voor één proberen houdt het totaal veel lager.
+async function overpassAttemptSequential(query, timeoutMs){
+  let lastError = null;
+  for(const endpoint of OVERPASS_ENDPOINTS){
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    try{
+      const res = await fetch(endpoint, {
+        method: 'POST',
+        body: 'data=' + encodeURIComponent(query),
+        signal: controller.signal
+      });
+      if(!res.ok){
+        const bodyText = await res.text().catch(() => '');
+        throw new Error(`${endpoint.replace('https://','').split('/')[0]}: HTTP ${res.status}${bodyText ? ' — ' + bodyText.slice(0,150) : ''}`);
+      }
+      const data = await res.json();
+      return data.elements;
+    }catch(err){
+      lastError = err.name === 'AbortError'
+        ? new Error(`${endpoint.replace('https://','').split('/')[0]}: timeout na ${timeoutMs/1000}s`)
+        : err;
+    }finally{
+      clearTimeout(timer);
+    }
+  }
+  throw lastError;
+}
+
+function sleep(ms){
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
 async function overpassAttempt(query, timeoutMs){
   const controllers = OVERPASS_ENDPOINTS.map(() => new AbortController());
   const timers = controllers.map(c => setTimeout(() => c.abort(), timeoutMs));
@@ -1113,22 +1151,32 @@ function escapeRegex(s){
   return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
-// Maakt wegnummer-invoer wat vergevingsgezinder: "n 10", " N10 ", "n10" worden allemaal "N10".
-// Spaties/streepjes binnen het nummer zelf (zoals "CA-141") laten we intact, alleen rondom-
-// spaties en losse spaties tussen letter en cijfer worden opgeruimd; matching in Overpass
-// is daarnaast al hoofdletterongevoelig.
+// Voor weergave/labels: een nette, opgeschoonde vorm ("n 10" / " N10 " -> "N10").
 function normalizeRoadNumber(input){
   return input.trim().replace(/\s+/g, '').toUpperCase();
 }
 
+// Voor het zoeken zelf bouwen we een patroon dat een eventuele spatie tussen het letterdeel
+// en het cijferdeel TOESTAAT maar niet EIST (bv. "N10" -> patroon dat zowel "N10" als "N 10"
+// in de brondata matcht) — OSM-data is hierin niet altijd consistent, en mijn eerdere aanpak
+// (spaties altijd wegstrippen) kon daardoor juist mis matchen tegen wegen die wél met een
+// spatie getagd zijn.
+function buildRoadNumberPattern(cleanedInput){
+  const match = cleanedInput.match(/^([A-Z]+)(\d.*)$/);
+  if(match){
+    return `${escapeRegex(match[1])}\\s*${escapeRegex(match[2])}`;
+  }
+  return escapeRegex(cleanedInput);
+}
+
 // Best-effort: probeert de wegen met dit wegnummer binnen het gebied te vinden, puur om
-// als visuele referentielijn op de kaart te tonen. Lukt dit niet, dan negeren we het gewoon —
-// de corridor-zoekopdracht zelf hangt hier niet vanaf.
+// als visuele referentielijn op de kaart te tonen én als "via"-tussenstops voor de route.
+// Lukt dit niet, dan negeren we het gewoon — de corridor-zoekopdracht zelf hangt hier niet vanaf.
 async function fetchRoadReference(bbox, roadNumber){
-  const escaped = escapeRegex(roadNumber);
-  const query = `[out:json][timeout:20][bbox:${bbox}];(way["highway"]["ref"~"${escaped}",i];);out geom;`;
+  const pattern = buildRoadNumberPattern(roadNumber);
+  const query = `[out:json][timeout:20][bbox:${bbox}];(way["highway"]["ref"~"${pattern}",i];);out geom;`;
   try{
-    return await overpassAttempt(query, 12000);
+    return await overpassAttemptSequential(query, 15000);
   }catch(err){
     return null;
   }
@@ -1138,16 +1186,15 @@ async function fetchRoutePois(bbox, categories){
   const allBlocks = categories.flatMap(c => c.variants.map(v => tagBlock(v)));
   const lines = allBlocks.map(f => `\n    node${f};\n    way${f};`).join('');
   const query = `[out:json][timeout:25][bbox:${bbox}];(${lines}\n  );out center tags 200;`;
-  return overpassAttempt(query, 20000);
+  return overpassAttemptSequential(query, 20000);
 }
 
-// Knipt de route op in stukken van maximaal ~zoveel km, zodat elke Overpass-query een
-// kleine, snelle bbox heeft in plaats van één grote query over de hele routelengte
-// (wat bij lange routes tot 504's/timeouts leidde, vooral met brede categorieën als
-// "parkeerplaats"). We geven kleine overlap tussen stukken zodat we geen POI's missen
-// die precies op een naad zouden vallen.
-function splitRouteIntoChunks(routeCoords, geometry, targetChunkKm){
+// Streeft naar hooguit ~4 stukken, ongeacht de routelengte: voor een korte route is elk stuk
+// klein (en dus snel), voor een lange route wordt elk stuk groter i.p.v. dat het aantal
+// stukken (en dus het aantal Overpass-aanroepen) blijft groeien.
+function splitRouteIntoChunks(routeCoords, geometry, maxChunks){
   const totalKm = geometry.cumulative[geometry.cumulative.length - 1];
+  const targetChunkKm = Math.max(60, totalKm / maxChunks);
   if(totalKm <= targetChunkKm) return [routeCoords];
 
   const chunks = [];
@@ -1165,16 +1212,13 @@ function splitRouteIntoChunks(routeCoords, geometry, targetChunkKm){
   return chunks;
 }
 
-// Haalt POI's op per routestuk (parallel), en voegt de resultaten samen zonder duplicaten.
-// Als één stuk faalt (bv. een trage server op dat moment), gaan de andere stukken gewoon door —
-// je krijgt dan resultaten voor de rest van de route i.p.v. een harde fout voor de hele zoekopdracht.
+// Haalt POI's op per routestuk, NA ELKAAR en met een korte pauze ertussen (i.p.v. alles
+// gelijktijdig te bevragen) om de publieke Overpass-servers niet te overbelasten.
+// Als één stuk toch faalt, gaan de andere stukken gewoon door — je krijgt dan resultaten
+// voor de rest van de route i.p.v. een harde fout voor de hele zoekopdracht.
 async function fetchRoutePoisChunked(routeCoords, geometry, categories, bufferKm){
-  const chunks = splitRouteIntoChunks(routeCoords, geometry, 60);
+  const chunks = splitRouteIntoChunks(routeCoords, geometry, 4);
 
-  // Bewust NA ELKAAR i.p.v. allemaal tegelijk: publieke Overpass-servers staan doorgaans
-  // maar een paar gelijktijdige verbindingen per IP toe. Met bv. 4 routestukken × 3 mirrors
-  // vuurden we voorheen 12 verzoeken tegelijk af, waardoor de meeste geweigerd/getimed-out
-  // werden. Sequentieel is iets trager, maar betrouwbaar veel completer.
   const seen = new Set();
   const merged = [];
   let failedChunks = 0;
@@ -1195,10 +1239,11 @@ async function fetchRoutePoisChunked(routeCoords, geometry, categories, bufferKm
     }catch(err){
       failedChunks++;
     }
+    if(i < chunks.length - 1) await sleep(500); // adempauze tussen stukken
   }
 
   if(merged.length === 0 && failedChunks > 0){
-    throw new Error(`Kon geen data ophalen voor ${failedChunks} van de ${chunks.length} routestukken. Probeer het nog eens.`);
+    throw new Error(`Kon geen data ophalen voor ${failedChunks} van de ${chunks.length} routestukken — de gratis Overpass-servers zijn mogelijk tijdelijk overbelast (ook door al het testen zonet). Wacht een paar minuten en probeer opnieuw.`);
   }
 
   return { elements: merged, failedChunks, totalChunks: chunks.length };
