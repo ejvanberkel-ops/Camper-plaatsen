@@ -314,6 +314,36 @@
   <!-- CAMPERPLAATSEN filters -->
   <div id="camperFilters">
     <div class="panel">
+      <h2>Zoekmethode</h2>
+      <div class="filters" id="camperSubModeChips">
+        <label class="chip active"><input type="radio" name="camperSubMode" value="radius" checked> 📍 Binnen een straal</label>
+        <label class="chip"><input type="radio" name="camperSubMode" value="route"> 🛣️ Op mijn route</label>
+      </div>
+    </div>
+
+    <div class="panel hidden" id="camperRoutePanel">
+      <h2>Route</h2>
+      <div class="row">
+        <input type="text" id="camperRouteStart" placeholder="Beginpunt, bv. Bordeaux" />
+        <button class="geoloc" id="camperRouteGeoBtn" title="Gebruik mijn locatie als beginpunt">📍</button>
+      </div>
+      <div class="row">
+        <input type="text" id="camperRouteEnd" placeholder="Eindpunt, bv. Poitiers" />
+      </div>
+      <div class="row">
+        <input type="text" id="camperRouteRoadNumber" placeholder="Wegnummer (optioneel), bv. N10" />
+      </div>
+      <div class="row">
+        <select id="camperRouteBuffer" style="flex:1;">
+          <option value="2">2 km van de route</option>
+          <option value="5" selected>5 km van de route</option>
+          <option value="10">10 km van de route</option>
+        </select>
+        <button class="primary" id="camperRouteSearchBtn">Zoeken</button>
+      </div>
+    </div>
+
+    <div class="panel">
       <h2>Type terrein</h2>
       <div class="filters" id="typeFilters">
         <label class="chip active"><input type="radio" name="siteType" value="caravan_site" checked> Camperplaatsen / aires</label>
@@ -428,12 +458,15 @@ const placeInput = document.getElementById('place');
 const legendEl = document.getElementById('legend');
 
 let currentMode = 'camper';
+let camperSubMode = 'radius';
 document.querySelectorAll('.mode-tab').forEach(tab => {
   tab.addEventListener('click', () => {
     document.querySelectorAll('.mode-tab').forEach(t => t.classList.remove('active'));
     tab.classList.add('active');
     currentMode = tab.dataset.mode;
-    document.getElementById('standardSearchPanel').classList.toggle('hidden', currentMode === 'route' || currentMode === 'hiking');
+    const camperWantsRoute = currentMode === 'camper' && camperSubMode === 'route';
+    document.getElementById('standardSearchPanel').classList.toggle('hidden', currentMode === 'route' || currentMode === 'hiking' || camperWantsRoute);
+    document.getElementById('camperRoutePanel').classList.toggle('hidden', !camperWantsRoute);
     document.getElementById('camperFilters').classList.toggle('hidden', currentMode !== 'camper');
     document.getElementById('pauzeFilters').classList.toggle('hidden', currentMode !== 'pauze');
     document.getElementById('poiFilters').classList.toggle('hidden', currentMode !== 'poi');
@@ -441,7 +474,7 @@ document.querySelectorAll('.mode-tab').forEach(tab => {
     document.getElementById('hikingFilters').classList.toggle('hidden', currentMode !== 'hiking');
     resultsEl.innerHTML = '';
     statusEl.textContent = currentMode === 'camper'
-      ? 'Zoek een plaats om camperplaatsen te vinden.'
+      ? (camperSubMode === 'radius' ? 'Zoek een plaats om camperplaatsen te vinden.' : 'Vul een beginpunt en eindpunt in om camperplaatsen langs je route te vinden.')
       : currentMode === 'pauze'
       ? 'Zoek een plaats om parkeerplekken bij picknicktafels te vinden.'
       : currentMode === 'poi'
@@ -452,6 +485,25 @@ document.querySelectorAll('.mode-tab').forEach(tab => {
     statusEl.classList.remove('error');
     clearAllMarkers();
     legendEl.innerHTML = '';
+  });
+});
+
+document.querySelectorAll('#camperSubModeChips .chip').forEach(chip => {
+  const radio = chip.querySelector('input');
+  radio.addEventListener('change', () => {
+    document.querySelectorAll('#camperSubModeChips .chip').forEach(c => c.classList.remove('active'));
+    chip.classList.add('active');
+    camperSubMode = radio.value;
+    const isRadius = camperSubMode === 'radius';
+    document.getElementById('standardSearchPanel').classList.toggle('hidden', !isRadius);
+    document.getElementById('camperRoutePanel').classList.toggle('hidden', isRadius);
+    resultsEl.innerHTML = '';
+    clearAllMarkers();
+    legendEl.innerHTML = '';
+    statusEl.classList.remove('error');
+    statusEl.textContent = isRadius
+      ? 'Zoek een plaats om camperplaatsen te vinden.'
+      : 'Vul een beginpunt en eindpunt in om camperplaatsen langs je route te vinden.';
   });
 });
 
@@ -676,6 +728,14 @@ function priceBadge(tags){
   }
   return '<span class="badge muted">Prijs onbekend</span>';
 }
+// Dezelfde camper-voorzieningenbadges (dump station, water, stroom, ...) als in de
+// Camperplaatsen-modus, maar herbruikbaar voor plekken die als "Camperplaats" naar voren
+// komen in de generieke POI- en routezoekopdrachten.
+function camperAmenityBadges(tags){
+  return Object.keys(badgeLabels)
+    .filter(k => tagPresent(tags, k))
+    .map(k => `<span class="badge">${badgeLabels[k]}</span>`).join('');
+}
 
 // ---------- CAMPERPLAATSEN zoeken ----------
 async function fetchCamperSites(lat, lon, radius, siteType){
@@ -760,6 +820,228 @@ function renderCamperResults(sites, center){
     bounds.push([site.lat, site.lon]);
   });
   bounds.push([center.lat, center.lon]);
+  map.fitBounds(bounds, {padding:[30,30]});
+}
+
+// ---------- CAMPERPLAATSEN op mijn route ----------
+async function fetchCamperSitesInBbox(bbox, siteType){
+  const tourismFilter = siteType === 'both'
+    ? `["tourism"~"^(camp_site|caravan_site)$"]`
+    : `["tourism"="${siteType}"]`;
+  const includeParkingVariant = siteType !== 'camp_site';
+  const parkingLines = includeParkingVariant ? `
+    node["amenity"="parking"]["motorhome"="yes"];
+    way["amenity"="parking"]["motorhome"="yes"];
+    node["amenity"="parking"]["parking"="motorhome"];
+    way["amenity"="parking"]["parking"="motorhome"];` : '';
+  const query = `[out:json][timeout:25][bbox:${bbox}];(
+    node${tourismFilter};
+    way${tourismFilter};${parkingLines}
+  );out center tags 200;`;
+  return overpassAttemptSequential(query, 20000);
+}
+
+// Zelfde beproefde patroon als bij "Op mijn route": route opknippen in max. 4 stukken,
+// na elkaar bevragen (niet racen) om de gratis Overpass-servers niet te overbelasten.
+async function fetchCamperSitesAlongRouteChunked(routeCoords, geometry, siteType, bufferKm){
+  const chunks = splitRouteIntoChunks(routeCoords, geometry, 4);
+
+  const seen = new Set();
+  const merged = [];
+  let failedChunks = 0;
+
+  for(let i = 0; i < chunks.length; i++){
+    if(chunks.length > 1){
+      statusEl.textContent = `Camperplaatsen ophalen langs de route… (stuk ${i+1} van ${chunks.length})`;
+    }
+    try{
+      const elements = await fetchCamperSitesInBbox(routeBbox(chunks[i], bufferKm), siteType);
+      elements.forEach(el => {
+        const key = `${el.type}:${el.id}`;
+        if(!seen.has(key)){
+          seen.add(key);
+          merged.push(el);
+        }
+      });
+    }catch(err){
+      failedChunks++;
+    }
+    if(i < chunks.length - 1) await sleep(500);
+  }
+
+  if(merged.length === 0 && failedChunks > 0){
+    throw new Error(`Kon geen data ophalen voor ${failedChunks} van de ${chunks.length} routestukken — de gratis Overpass-servers zijn mogelijk tijdelijk overbelast. Wacht een paar minuten en probeer opnieuw.`);
+  }
+
+  return { elements: merged, failedChunks, totalChunks: chunks.length };
+}
+
+async function runCamperRouteSearch(){
+  const startQuery = document.getElementById('camperRouteStart').value.trim();
+  const endQuery = document.getElementById('camperRouteEnd').value.trim();
+  const roadNumber = normalizeRoadNumber(document.getElementById('camperRouteRoadNumber').value);
+  const bufferKm = parseInt(document.getElementById('camperRouteBuffer').value, 10);
+  const siteType = selectedSiteType();
+  const priceType = selectedPriceType();
+  const amenityFilters = activeAmenityFilters();
+
+  if(!startQuery || !endQuery){
+    statusEl.textContent = 'Vul zowel een beginpunt als een eindpunt in.';
+    statusEl.classList.add('error');
+    return;
+  }
+
+  camperRouteSearchBtn.disabled = true;
+  camperRouteSearchBtn.textContent = 'Zoeken…';
+  statusEl.classList.remove('error');
+  resultsEl.innerHTML = '';
+  clearAllMarkers();
+  legendEl.innerHTML = '';
+
+  try{
+    statusEl.textContent = 'Beginpunt en eindpunt opzoeken…';
+    const startLoc = await resolveLocation(document.getElementById('camperRouteStart'));
+    const endLoc = await resolveLocation(document.getElementById('camperRouteEnd'));
+
+    let roadRefCoords = null;
+    let viaPoints = null;
+    if(roadNumber){
+      statusEl.textContent = `Weg ${roadNumber} opzoeken…`;
+      const prelimBbox = routeBbox([[startLoc.lat, startLoc.lon], [endLoc.lat, endLoc.lon]], bufferKm + 15);
+      const ways = await fetchRoadReference(prelimBbox, roadNumber);
+      if(ways && ways.length){
+        roadRefCoords = ways.filter(w => w.geometry && w.geometry.length).map(w => w.geometry.map(g => [g.lat, g.lon]));
+        viaPoints = sampleViaPointsFromWays(ways, startLoc, endLoc, 8);
+      }
+    }
+
+    statusEl.textContent = 'Route ophalen…';
+    let routeCoords, routeSource;
+    try{
+      routeCoords = await fetchOsrmRoute(startLoc, endLoc, viaPoints && viaPoints.length ? viaPoints : null);
+      routeSource = viaPoints && viaPoints.length ? 'route-via-road' : 'route';
+    }catch(routeErr){
+      if(viaPoints && viaPoints.length){
+        try{
+          routeCoords = await fetchOsrmRoute(startLoc, endLoc, null);
+          routeSource = 'route';
+        }catch(err2){
+          routeCoords = [[startLoc.lat, startLoc.lon], [endLoc.lat, endLoc.lon]];
+          routeSource = 'straight';
+        }
+      } else {
+        routeCoords = [[startLoc.lat, startLoc.lon], [endLoc.lat, endLoc.lon]];
+        routeSource = 'straight';
+      }
+    }
+
+    const geometry = prepareRouteGeometry(routeCoords);
+
+    statusEl.textContent = 'Camperplaatsen ophalen langs de route…';
+    const { elements, failedChunks, totalChunks } = await fetchCamperSitesAlongRouteChunked(routeCoords, geometry, siteType, bufferKm);
+
+    let sites = elements.map(el => {
+      const {lat, lon} = elementLatLon(el);
+      if(!lat || !lon) return null;
+      const tags = el.tags || {};
+      const info = nearestRouteInfo(lat, lon, geometry);
+      return {
+        id: el.id, type: el.type, tags, lat, lon,
+        distanceFromRoute: info.distance,
+        progressKm: info.progress
+      };
+    }).filter(Boolean).filter(s => s.distanceFromRoute <= bufferKm);
+
+    if(amenityFilters.length) sites = sites.filter(s => amenityFilters.every(f => tagPresent(s.tags, f)));
+    sites = sites.filter(s => feeMatches(s.tags, priceType));
+
+    sites.sort((a,b) => a.progressKm - b.progressKm);
+
+    const totalRouteKm = geometry.cumulative[geometry.cumulative.length - 1];
+    const sourceNote = routeSource === 'straight'
+      ? ' — let op: geen rijroute gevonden, dit is een rechte lijn'
+      : routeSource === 'route-via-road'
+      ? ` — route gestuurd via ${roadNumber}`
+      : '';
+    const chunkNote = failedChunks > 0
+      ? ` (let op: ${failedChunks} van de ${totalChunks} routestukken kon niet opgehaald worden — mogelijk ontbreken daar resultaten, probeer eventueel opnieuw)`
+      : '';
+    const activeExtras = amenityFilters.length || priceType !== 'all';
+    statusEl.textContent = `${sites.length} terrein${sites.length === 1 ? '' : 'en'} gevonden binnen ${bufferKm} km van de route van ${startLoc.label.split(',')[0]} naar ${endLoc.label.split(',')[0]} (~${totalRouteKm.toFixed(0)} km)${sourceNote}${activeExtras ? ' (gefilterd)' : ''}.${chunkNote}`;
+
+    renderCamperRouteResults(sites, routeCoords, roadRefCoords, startLoc, endLoc, routeSource);
+
+  }catch(err){
+    statusEl.textContent = err.message || 'Er ging iets mis.';
+    statusEl.classList.add('error');
+    resultsEl.innerHTML = '';
+  }finally{
+    camperRouteSearchBtn.disabled = false;
+    camperRouteSearchBtn.textContent = 'Zoeken';
+  }
+}
+
+function renderCamperRouteResults(sites, routeCoords, roadRefCoords, startLoc, endLoc, routeSource){
+  clearAllMarkers();
+  resultsEl.innerHTML = '';
+
+  const routeLine = L.polyline(routeCoords, {
+    color: '#4A7C94', weight: 4, opacity: 0.85,
+    dashArray: routeSource === 'straight' ? '8 8' : null
+  }).addTo(map);
+  contextMarkers.push(routeLine);
+
+  if(roadRefCoords){
+    roadRefCoords.forEach(coords => {
+      const line = L.polyline(coords, {color:'#C67F17', weight:3, opacity:0.7, dashArray:'4 6'}).addTo(map);
+      contextMarkers.push(line);
+    });
+  }
+
+  const startMarker = L.circleMarker(routeCoords[0], {radius:7, color:'#1D3B2C', fillColor:'#1D3B2C', fillOpacity:1, weight:2})
+    .addTo(map).bindPopup('Start: ' + startLoc.label.split(',')[0]);
+  const endMarker = L.circleMarker(routeCoords[routeCoords.length-1], {radius:7, color:'#A33B2A', fillColor:'#A33B2A', fillOpacity:1, weight:2})
+    .addTo(map).bindPopup('Eind: ' + endLoc.label.split(',')[0]);
+  contextMarkers.push(startMarker, endMarker);
+
+  legendEl.innerHTML = `
+    <span><i style="background:#4A7C94;"></i> Route${routeSource === 'straight' ? ' (rechte lijn)' : routeSource === 'route-via-road' ? ' (via wegnummer)' : ''}</span>
+    ${roadRefCoords ? `<span><i style="background:#C67F17;"></i> Wegnummer-referentie</span>` : ''}
+    <span><i style="background:#1D3B2C;"></i> Start</span>
+    <span><i style="background:#A33B2A;"></i> Eind</span>`;
+
+  const bounds = [...routeCoords];
+
+  if(!sites.length){
+    resultsEl.innerHTML = `<div class="empty"><div class="display">Geen terreinen gevonden langs deze route</div>Probeer een ruimere afstand tot de route, of andere filters.</div>`;
+    map.fitBounds(bounds, {padding:[30,30]});
+    return;
+  }
+
+  sites.forEach((site, i) => {
+    const el = document.createElement('div');
+    el.className = 'site';
+    const distLabel = site.distanceFromRoute < 1
+      ? (site.distanceFromRoute*1000).toFixed(0) + ' m'
+      : site.distanceFromRoute.toFixed(1) + ' km';
+    const badges = priceBadge(site.tags) + camperAmenityBadges(site.tags) + `<span class="badge">📍 ${distLabel} van route</span>`;
+    el.innerHTML = `
+      <div class="pin">${i+1}</div>
+      <div class="body">
+        <p class="name">${site.tags.name || 'Naamloos terrein'} <span class="dist">${site.progressKm.toFixed(0)} km vanaf start</span></p>
+        <p class="addr">${[site.tags['addr:street'], site.tags['addr:city']].filter(Boolean).join(', ') || 'Geen adres bekend'}</p>
+        <div class="badges">${badges}</div>
+        <div class="links">
+          <a class="gmaps-link" href="${googleMapsLink(site.lat, site.lon)}" target="_blank">🧭 Navigeer</a>
+          <a class="osm-link" href="https://www.openstreetmap.org/${site.type}/${site.id}" target="_blank">Bekijk op OpenStreetMap →</a>
+        </div>
+      </div>`;
+    resultsEl.appendChild(el);
+    const marker = L.marker([site.lat, site.lon]).addTo(map)
+      .bindPopup(`<b>${site.tags.name || 'Naamloos terrein'}</b><br>${site.progressKm.toFixed(0)} km vanaf start · ${distLabel} van route<br><a href="${googleMapsLink(site.lat, site.lon)}" target="_blank">🧭 Navigeer</a>`);
+    mainMarkers.push(marker);
+    bounds.push([site.lat, site.lon]);
+  });
   map.fitBounds(bounds, {padding:[30,30]});
 }
 
@@ -1037,13 +1319,14 @@ function renderPoiResults(sites, center){
       ? `<span class="badge warn">Betaald${site.tags.charge ? ' · ' + site.tags.charge : ''}</span>`
       : site.tags.fee === 'no' ? `<span class="badge good">Gratis</span>` : '';
     const descLine = site.tags.description ? `<p class="addr" style="font-style:italic;">${site.tags.description}</p>` : '';
+    const camperBadges = site.categoryLabel === 'Camperplaats' ? camperAmenityBadges(site.tags) : '';
     el.innerHTML = `
       <div class="pin">${i+1}</div>
       <div class="body">
         <p class="name">${site.tags.name || 'Naamloze locatie'} <span class="dist">${site.distance.toFixed(1)} km</span></p>
         <p class="addr">${addrParts.join(' ') || 'Geen adres bekend'}</p>
         ${descLine}
-        <div class="badges"><span class="badge">${site.categoryLabel}</span>${accessBadge}${feeBadge}</div>
+        <div class="badges"><span class="badge">${site.categoryLabel}</span>${accessBadge}${feeBadge}${camperBadges}</div>
         <div class="links">
           <a class="gmaps-link" href="${googleMapsLink(site.lat, site.lon)}" target="_blank">🧭 Navigeer</a>
           <a class="osm-link" href="https://www.openstreetmap.org/${site.type}/${site.id}" target="_blank">Bekijk op OpenStreetMap →</a>
@@ -1484,13 +1767,14 @@ function renderRouteResults(sites, routeCoords, roadRefCoords, startLoc, endLoc,
       ? `<span class="badge warn">Betaald${site.tags.charge ? ' · ' + site.tags.charge : ''}</span>`
       : site.tags.fee === 'no' ? `<span class="badge good">Gratis</span>` : '';
     const descLine = site.tags.description ? `<p class="addr" style="font-style:italic;">${site.tags.description}</p>` : '';
+    const camperBadges = site.categoryLabel === 'Camperplaats' ? camperAmenityBadges(site.tags) : '';
     el.innerHTML = `
       <div class="pin">${i+1}</div>
       <div class="body">
         <p class="name">${site.tags.name || 'Naamloze locatie'} <span class="dist">${site.progressKm.toFixed(0)} km vanaf start</span></p>
         <p class="addr">${addrParts.join(' ') || 'Geen adres bekend'}</p>
         ${descLine}
-        <div class="badges"><span class="badge">${site.categoryLabel}</span><span class="badge">📍 ${distLabel} van route</span>${accessBadge}${feeBadge}</div>
+        <div class="badges"><span class="badge">${site.categoryLabel}</span><span class="badge">📍 ${distLabel} van route</span>${accessBadge}${feeBadge}${camperBadges}</div>
         <div class="links">
           <a class="gmaps-link" href="${googleMapsLink(site.lat, site.lon)}" target="_blank">🧭 Navigeer</a>
           <a class="osm-link" href="https://www.openstreetmap.org/${site.type}/${site.id}" target="_blank">Bekijk op OpenStreetMap →</a>
@@ -1604,6 +1888,34 @@ routeGeoBtn.addEventListener('click', () => {
     routeStartInput.dataset.lon = longitude;
     routeStartInput.dataset.resolvedFor = 'Huidige locatie';
     routeStartInput.dataset.resolvedLabel = 'Huidige locatie';
+    statusEl.textContent = 'Beginpunt ingesteld op je huidige locatie. Vul nu een eindpunt in en zoek.';
+  }, () => {
+    statusEl.textContent = 'Kon je locatie niet ophalen. Check of locatietoegang aanstaat, of vul handmatig een beginpunt in.';
+  });
+});
+
+// ---------- knoppen voor "Camperplaatsen op mijn route" ----------
+const camperRouteSearchBtn = document.getElementById('camperRouteSearchBtn');
+const camperRouteStartInput = document.getElementById('camperRouteStart');
+const camperRouteGeoBtn = document.getElementById('camperRouteGeoBtn');
+
+camperRouteSearchBtn.addEventListener('click', runCamperRouteSearch);
+clearLocationCacheOnEdit(camperRouteStartInput);
+document.getElementById('camperRouteEnd').addEventListener('keydown', e => { if(e.key === 'Enter') runCamperRouteSearch(); });
+
+camperRouteGeoBtn.addEventListener('click', () => {
+  if(!navigator.geolocation){
+    statusEl.textContent = 'Locatie delen wordt niet ondersteund door deze browser.';
+    return;
+  }
+  statusEl.textContent = 'Locatie ophalen…';
+  navigator.geolocation.getCurrentPosition(pos => {
+    const {latitude, longitude} = pos.coords;
+    camperRouteStartInput.value = 'Huidige locatie';
+    camperRouteStartInput.dataset.lat = latitude;
+    camperRouteStartInput.dataset.lon = longitude;
+    camperRouteStartInput.dataset.resolvedFor = 'Huidige locatie';
+    camperRouteStartInput.dataset.resolvedLabel = 'Huidige locatie';
     statusEl.textContent = 'Beginpunt ingesteld op je huidige locatie. Vul nu een eindpunt in en zoek.';
   }, () => {
     statusEl.textContent = 'Kon je locatie niet ophalen. Check of locatietoegang aanstaat, of vul handmatig een beginpunt in.';
