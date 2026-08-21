@@ -184,6 +184,17 @@
 
 <main>
 
+  <!-- Zoekmethode-keuze voor Camperplaatsen (staat hier, vóór het gedeelde "Waar naartoe?"-
+       paneel, zodat de volgorde overal in de app hetzelfde is: eerst kiezen HOE je zoekt,
+       dan pas het bijpassende invoerveld — zie ook Wandelroutes. ) -->
+  <div class="panel hidden" id="camperSubModePanel">
+    <h2>Zoekmethode</h2>
+    <div class="filters" id="camperSubModeChips">
+      <label class="chip active"><input type="radio" name="camperSubMode" value="radius" checked> 📍 Binnen een straal</label>
+      <label class="chip"><input type="radio" name="camperSubMode" value="route"> 🛣️ Op mijn route</label>
+    </div>
+  </div>
+
   <div class="panel" id="standardSearchPanel">
     <h2>Waar naartoe?</h2>
     <div class="row">
@@ -253,7 +264,7 @@
       <h2>Zoekmethode</h2>
       <div class="filters" id="hikingSubModeChips">
         <label class="chip active"><input type="radio" name="hikingSubMode" value="radius" checked> 📍 Binnen een straal</label>
-        <label class="chip"><input type="radio" name="hikingSubMode" value="between"> 🧭 Tussen twee plaatsen</label>
+        <label class="chip"><input type="radio" name="hikingSubMode" value="between"> 🛣️ Op mijn route</label>
       </div>
     </div>
 
@@ -313,14 +324,6 @@
 
   <!-- CAMPERPLAATSEN filters -->
   <div id="camperFilters">
-    <div class="panel">
-      <h2>Zoekmethode</h2>
-      <div class="filters" id="camperSubModeChips">
-        <label class="chip active"><input type="radio" name="camperSubMode" value="radius" checked> 📍 Binnen een straal</label>
-        <label class="chip"><input type="radio" name="camperSubMode" value="route"> 🛣️ Op mijn route</label>
-      </div>
-    </div>
-
     <div class="panel hidden" id="camperRoutePanel">
       <h2>Route</h2>
       <div class="row">
@@ -465,6 +468,7 @@ document.querySelectorAll('.mode-tab').forEach(tab => {
     tab.classList.add('active');
     currentMode = tab.dataset.mode;
     const camperWantsRoute = currentMode === 'camper' && camperSubMode === 'route';
+    document.getElementById('camperSubModePanel').classList.toggle('hidden', currentMode !== 'camper');
     document.getElementById('standardSearchPanel').classList.toggle('hidden', currentMode === 'route' || currentMode === 'hiking' || camperWantsRoute);
     document.getElementById('camperRoutePanel').classList.toggle('hidden', !camperWantsRoute);
     document.getElementById('camperFilters').classList.toggle('hidden', currentMode !== 'camper');
@@ -480,7 +484,7 @@ document.querySelectorAll('.mode-tab').forEach(tab => {
       : currentMode === 'poi'
       ? 'Kies een categorie en zoek een plaats.'
       : currentMode === 'hiking'
-      ? 'Kies binnen een straal of tussen twee plaatsen, en zoek.'
+      ? 'Kies binnen een straal of op je route, en zoek.'
       : 'Vul een beginpunt en eindpunt in, en kies wat je onderweg zoekt.';
     statusEl.classList.remove('error');
     clearAllMarkers();
